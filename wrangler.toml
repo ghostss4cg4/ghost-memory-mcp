@@ -1,0 +1,16 @@
+name = "saumil-memory-gateway"
+main = "src/worker.js"
+compatibility_date = "2026-04-14"
+
+# All sensitive values are secrets — never stored here.
+# Set via: bash scripts/set-secrets.sh
+# Or via GitHub Actions (see .github/workflows/deploy.yml)
+#
+# Required secrets:
+#   UPSTASH_REDIS_REST_URL
+#   UPSTASH_REDIS_REST_TOKEN
+#   QDRANT_URL
+#   QDRANT_API_KEY
+#   NOTION_TOKEN
+#   NOTION_PAGE_ID
+#   MCP_AUTH_TOKEN
