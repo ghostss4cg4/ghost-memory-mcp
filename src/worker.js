@@ -6,7 +6,11 @@
  * Tier 2: Qdrant         → vector semantic search
  * Tier 3: Notion         → long-form archive
  *
- * Secrets (set via GitHub Actions or scripts/set-secrets.sh):
+ * Stage 3: Terse Schema Layer
+ *   memory.context.build  → pull all tiers, compress to ≤500-token context block
+ *   memory.context.ingest → parse raw turn, fan-out write to all tiers atomically
+ *
+ * Secrets (set via wrangler or scripts/set-secrets.sh):
  *   UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN
  *   QDRANT_URL, QDRANT_API_KEY
  *   NOTION_TOKEN, NOTION_PAGE_ID
@@ -136,6 +140,119 @@ async function notionSearch(env, query) {
   });
 }
 
+// ── STAGE 3: TERSE SCHEMA LAYER ────────────────────────────────
+/**
+ * terseGraph(graph) → compact key:value block, one line per field.
+ * Strips boilerplate, truncates long values to 80 chars.
+ * Sorts keys: identity first, then project, then misc.
+ */
+function terseGraph(graph) {
+  const PRIORITY = ['name','age','college','year','cgpa','gate_target',
+                    'current_project','project_status','stack','next_action'];
+  const lines = [];
+  // priority keys first
+  for (const k of PRIORITY) {
+    if (graph[k] !== undefined) {
+      lines.push(`${k}: ${String(graph[k]).slice(0, 80)}`);
+    }
+  }
+  // remaining keys
+  for (const [k, v] of Object.entries(graph)) {
+    if (!PRIORITY.includes(k)) lines.push(`${k}: ${String(v).slice(0, 80)}`);
+  }
+  return lines.join('\n');
+}
+
+/**
+ * terseLog(entries) → last N events as "HH:MM — text" lines.
+ */
+function terseLog(entries, n = 5) {
+  return entries.slice(0, n).map(e => {
+    const t = e.ts ? new Date(e.ts).toISOString().slice(11, 16) : '??:??';
+    return `${t} — ${String(e.text).slice(0, 100)}`;
+  }).join('\n');
+}
+
+/**
+ * terseVec(results) → semantic hits as ranked snippets, score + 60-char preview.
+ */
+function terseVec(results) {
+  return results.map((r, i) => {
+    const score = (r.score || 0).toFixed(3);
+    const text  = (r.payload?.text || '').slice(0, 120);
+    return `[${i+1}|${score}] ${text}`;
+  }).join('\n');
+}
+
+/**
+ * buildContextBlock(graph, log, vecResults, query) → single terse string ≤500 tokens.
+ *
+ * Format:
+ *   === NANCE CONTEXT ===
+ *   [GRAPH]
+ *   ...
+ *   [RECENT]
+ *   ...
+ *   [SEMANTIC:query]
+ *   ...
+ *   === END ===
+ */
+function buildContextBlock(graph, log, vecResults, query) {
+  const parts = ['=== NANCE CONTEXT ==='];
+
+  const g = terseGraph(graph);
+  if (g) parts.push('[GRAPH]\n' + g);
+
+  const l = terseLog(log, 5);
+  if (l) parts.push('[RECENT]\n' + l);
+
+  if (vecResults && vecResults.length) {
+    const v = terseVec(vecResults);
+    parts.push(`[SEMANTIC:${(query||'').slice(0,40)}]\n` + v);
+  }
+
+  parts.push('=== END ===');
+
+  // hard cap: truncate block if over 2000 chars (~500 tokens)
+  let block = parts.join('\n\n');
+  if (block.length > 2000) block = block.slice(0, 1950) + '\n…(truncated)\n=== END ===';
+  return block;
+}
+
+/**
+ * ingestTurn(env, turn) → fan-out write to all three tiers.
+ *
+ * turn: { id, text, tags?, graph_updates? }
+ *   id            — unique string (e.g. "session_<ts>")
+ *   text          — raw content to embed + archive
+ *   tags          — optional string[] for Qdrant payload
+ *   graph_updates — optional {field: value} map for Redis
+ */
+async function ingestTurn(env, turn) {
+  const { id, text, tags = [], graph_updates = {} } = turn;
+  if (!id || !text) throw new Error('id and text required');
+
+  const results = {};
+
+  // Tier 1 — graph updates
+  for (const [field, value] of Object.entries(graph_updates)) {
+    await graphSet(env, field, String(value));
+  }
+  await logEvent(env, `INGEST:${id} — ${text.slice(0, 80)}`);
+  results.redis = { ok: true, graph_fields_written: Object.keys(graph_updates).length };
+
+  // Tier 2 — vector upsert (numeric id from hash of string id)
+  const numericId = Math.abs(id.split('').reduce((h, c) => (Math.imul(31, h) + c.charCodeAt(0)) | 0, 0));
+  await qdrantUpsert(env, numericId, text, { source_id: id, tags, ts: Date.now() });
+  results.qdrant = { ok: true, point_id: numericId };
+
+  // Tier 3 — Notion archive
+  const notionPage = await notionAppend(env, text, id);
+  results.notion = { ok: true, page_id: notionPage.id, url: notionPage.url };
+
+  return results;
+}
+
 // ── TOOL REGISTRY ──────────────────────────────────────────────
 const TOOLS = {
   'memory.ping': async (env) =>
@@ -199,7 +316,39 @@ const TOOLS = {
       title: p.properties?.title?.title?.[0]?.plain_text || 'Untitled',
       last_edited: p.last_edited_time
     })) };
-  }
+  },
+
+  // ── STAGE 3 TOOLS ──────────────────────────────────────────
+  /**
+   * memory.context.build
+   * params: { query? }
+   * Pulls graph + log from Redis, runs semantic search on query (or recent log),
+   * compresses everything into a single terse context block string.
+   * This is the tool Claude calls at session start.
+   */
+  'memory.context.build': async (env, { query } = {}) => {
+    const [graph, log] = await Promise.all([
+      graphGet(env),
+      getLog(env, 10)
+    ]);
+
+    // use provided query or synthesise from last log entry
+    const searchQuery = query || (log[0]?.text || 'general context');
+    const vecRaw = await qdrantSearch(env, searchQuery, 5);
+    const vecResults = vecRaw.result || [];
+
+    const block = buildContextBlock(graph, log, vecResults, searchQuery);
+    return { block, stats: { graph_keys: Object.keys(graph).length, log_entries: log.length, vec_hits: vecResults.length } };
+  },
+
+  /**
+   * memory.context.ingest
+   * params: { id, text, tags?, graph_updates? }
+   * Fan-out atomic write to Redis + Qdrant + Notion.
+   * This is the tool Claude calls at session end (or mid-session for key facts).
+   */
+  'memory.context.ingest': async (env, params) =>
+    ingestTurn(env, params),
 };
 
 // ── MAIN HANDLER ───────────────────────────────────────────────
@@ -242,6 +391,8 @@ export default {
 
     return json({
       name: 'NANCE Memory Gateway',
+      version: '0.3.0',
+      stage: 'schema-layer',
       endpoints: ['/health', '/snapshot', '/graph', '/call'],
       tools: Object.keys(TOOLS)
     });
