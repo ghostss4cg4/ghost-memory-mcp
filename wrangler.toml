@@ -2,6 +2,9 @@ name = "saumil-memory-gateway"
 main = "src/worker.js"
 compatibility_date = "2026-04-14"
 
+[ai]
+binding = "AI"
+
 # All sensitive values are secrets — never stored here.
 # Set via: bash scripts/set-secrets.sh
 # Or via GitHub Actions (see .github/workflows/deploy.yml)
@@ -14,3 +17,9 @@ compatibility_date = "2026-04-14"
 #   NOTION_TOKEN
 #   NOTION_PAGE_ID
 #   MCP_AUTH_TOKEN
+#
+# Stage 4 proxy secrets (add when ready):
+#   GITHUB_TOKEN
+#   GOOGLE_CLIENT_ID
+#   GOOGLE_CLIENT_SECRET
+#   GOOGLE_REFRESH_TOKEN
