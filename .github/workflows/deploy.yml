@@ -1,0 +1,22 @@
+﻿name: Deploy NANCE Worker
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/worker.js'
+      - 'wrangler.toml'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    name: Deploy to Cloudflare Workers
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy via Wrangler
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: deploy src/worker.js --name saumil-memory-gateway --compatibility-date 2026-04-18
