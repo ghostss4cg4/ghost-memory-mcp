@@ -1,6 +1,6 @@
-// NANCE Memory Gateway — v0.4.0
-// Stage 2: Real embeddings via CF Workers AI @cf/baai/bge-small-en-v1.5
-// Stage 4: proxy.github + proxy.google scaffolding (secrets-gated)
+// NANCE Memory Gateway — v0.5.0
+// Stage 5: MCP protocol layer — GET /mcp (manifest) + POST /mcp (tool dispatch)
+// All prior stages preserved intact.
 
 function cors(res) {
   const h = new Headers(res.headers);
@@ -50,14 +50,11 @@ async function getLog(env, n = 20) {
 }
 
 // ── Embeddings (CF Workers AI) ───────────────────────────────
-// Replaces pseudoEmbed. Calls bge-small-en-v1.5 (384-dim, cosine).
-// Falls back to pseudoEmbed only if AI binding is missing (local dev).
 async function embed(env, text) {
   if (env.AI) {
     const res = await env.AI.run("@cf/baai/bge-small-en-v1.5", { text: [text] });
     return res.data[0];
   }
-  // local dev fallback — deterministic hash, NOT semantically meaningful
   console.warn("[NANCE] AI binding missing — falling back to pseudoEmbed");
   return pseudoEmbedFallback(text);
 }
@@ -124,13 +121,10 @@ async function notionSearch(env, query) {
   });
 }
 
-// ── Stage 4: Google OAuth helper ─────────────────────────────
-// Returns a fresh access token using stored refresh token.
-// Requires secrets: GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN
+// ── Google OAuth ─────────────────────────────────────────────
 async function googleAccessToken(env) {
-  if (!env.GOOGLE_CLIENT_ID || !env.GOOGLE_CLIENT_SECRET || !env.GOOGLE_REFRESH_TOKEN) {
-    throw new Error("Google proxy secrets not configured. Add GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN via wrangler secret put.");
-  }
+  if (!env.GOOGLE_CLIENT_ID || !env.GOOGLE_CLIENT_SECRET || !env.GOOGLE_REFRESH_TOKEN)
+    throw new Error("Google proxy secrets not configured.");
   const res = await fetch("https://oauth2.googleapis.com/token", {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -142,7 +136,7 @@ async function googleAccessToken(env) {
     })
   });
   const data = await res.json();
-  if (!data.access_token) throw new Error(`Google token refresh failed: ${data.error} — ${data.error_description}`);
+  if (!data.access_token) throw new Error(`Google token refresh failed: ${data.error}`);
   return data.access_token;
 }
 
@@ -198,8 +192,6 @@ async function ingestTurn(env, turn) {
 
 // ── TOOLS ────────────────────────────────────────────────────
 const TOOLS = {
-
-  // Core memory tools (Stage 1–3, unchanged)
   "memory.ping":         async (env) => ({ status: "ok", ts: Date.now(), worker: "saumil-memory-gateway" }),
   "memory.snapshot":     async (env) => ({ graph: await graphGet(env), recent_log: await getLog(env, 10) }),
   "memory.graph.get":    async (env) => ({ graph: await graphGet(env) }),
@@ -246,8 +238,6 @@ const TOOLS = {
       last_edited: p.last_edited_time
     })) };
   },
-
-  // Stage 3 — context layer
   "memory.context.build": async (env, { query } = {}) => {
     const [graph, log] = await Promise.all([graphGet(env), getLog(env, 10)]);
     const searchQuery = query || (log[0]?.text || "general context");
@@ -257,97 +247,319 @@ const TOOLS = {
     return { block, stats: { graph_keys: Object.keys(graph).length, log_entries: log.length, vec_hits: vecResults.length } };
   },
   "memory.context.ingest": async (env, params) => ingestTurn(env, params),
-
-  // ── Stage 4a: GitHub Proxy ───────────────────────────────
-  // Requires secret: GITHUB_TOKEN (fine-grained PAT or classic)
-  // Usage: { method?, path, body? }
-  // path is the GitHub API path, e.g. "/repos/ghostss4cg4/ghost-memory-mcp/issues"
   "proxy.github": async (env, { method = "GET", path, body } = {}) => {
-    if (!env.GITHUB_TOKEN) throw new Error("GITHUB_TOKEN secret not configured. Run: wrangler secret put GITHUB_TOKEN");
-    if (!path) throw new Error("path required (e.g. /repos/owner/repo/issues)");
+    if (!env.GITHUB_TOKEN) throw new Error("GITHUB_TOKEN secret not configured.");
+    if (!path) throw new Error("path required");
     const res = await fetch(`https://api.github.com${path}`, {
       method,
       headers: {
         Authorization: `Bearer ${env.GITHUB_TOKEN}`,
         Accept: "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
-        "User-Agent": "NANCE-Memory-Gateway/0.4.0",
+        "User-Agent": "NANCE-Memory-Gateway/0.5.0",
         ...(body ? { "Content-Type": "application/json" } : {})
       },
       body: body ? JSON.stringify(body) : undefined
     });
     return { status: res.status, data: await res.json() };
   },
-
-  // ── Stage 4b: Gmail Proxy ────────────────────────────────
-  // Requires secrets: GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN
-  // Usage: { method?, path, body? }
-  // path is relative to https://gmail.googleapis.com
-  // e.g. "/gmail/v1/users/me/messages?maxResults=10"
   "proxy.gmail": async (env, { method = "GET", path, body } = {}) => {
-    if (!path) throw new Error("path required (e.g. /gmail/v1/users/me/messages)");
+    if (!path) throw new Error("path required");
     const token = await googleAccessToken(env);
     const res = await fetch(`https://gmail.googleapis.com${path}`, {
-      method,
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json"
-      },
+      method, headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
       body: body ? JSON.stringify(body) : undefined
     });
     return { status: res.status, data: await res.json() };
   },
-
-  // ── Stage 4c: Google Calendar Proxy ─────────────────────
-  // Requires secrets: GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN
-  // Usage: { method?, path, body? }
-  // path is relative to https://www.googleapis.com/calendar/v3
-  // e.g. "/calendars/primary/events?maxResults=10&orderBy=startTime&singleEvents=true"
   "proxy.calendar": async (env, { method = "GET", path, body } = {}) => {
-    if (!path) throw new Error("path required (e.g. /calendars/primary/events)");
+    if (!path) throw new Error("path required");
     const token = await googleAccessToken(env);
     const res = await fetch(`https://www.googleapis.com/calendar/v3${path}`, {
-      method,
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json"
-      },
+      method, headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
       body: body ? JSON.stringify(body) : undefined
     });
     return { status: res.status, data: await res.json() };
   }
 };
 
+// ── Stage 5: MCP Manifest ────────────────────────────────────
+// Schema definitions for every tool. Used in GET /mcp.
+// Claude reads this to know what tools exist and how to call them.
+const MCP_TOOL_SCHEMAS = [
+  {
+    name: "memory.ping",
+    description: "Health check. Returns status and server timestamp.",
+    inputSchema: { type: "object", properties: {}, required: [] }
+  },
+  {
+    name: "memory.snapshot",
+    description: "Returns full memory graph (key-value facts) and last 10 log entries.",
+    inputSchema: { type: "object", properties: {}, required: [] }
+  },
+  {
+    name: "memory.graph.get",
+    description: "Fetch all key-value fields from the persistent memory graph.",
+    inputSchema: { type: "object", properties: {}, required: [] }
+  },
+  {
+    name: "memory.graph.set",
+    description: "Write or update a single key-value field in the memory graph.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        field: { type: "string", description: "The key to write (e.g. 'current_project')" },
+        value: { type: "string", description: "The value to store" }
+      },
+      required: ["field", "value"]
+    }
+  },
+  {
+    name: "memory.graph.delete",
+    description: "Delete a field from the memory graph.",
+    inputSchema: {
+      type: "object",
+      properties: { field: { type: "string", description: "The key to delete" } },
+      required: ["field"]
+    }
+  },
+  {
+    name: "memory.log.get",
+    description: "Retrieve recent event log entries.",
+    inputSchema: {
+      type: "object",
+      properties: { n: { type: "integer", description: "Number of entries to fetch (default 20, max 50)" } },
+      required: []
+    }
+  },
+  {
+    name: "memory.log.append",
+    description: "Append a text entry to the event log.",
+    inputSchema: {
+      type: "object",
+      properties: { text: { type: "string", description: "Log entry text" } },
+      required: ["text"]
+    }
+  },
+  {
+    name: "memory.vector.ensure_collection",
+    description: "Ensure the Qdrant vector collection exists. Idempotent. Call once on setup.",
+    inputSchema: { type: "object", properties: {}, required: [] }
+  },
+  {
+    name: "memory.vector.upsert",
+    description: "Embed text and upsert a vector point into Qdrant.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Unique string ID for this point" },
+        text: { type: "string", description: "Text to embed and store" },
+        payload: { type: "object", description: "Optional metadata to attach", default: {} }
+      },
+      required: ["id", "text"]
+    }
+  },
+  {
+    name: "memory.vector.search",
+    description: "Semantic search over stored memory vectors.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        text: { type: "string", description: "Query text to embed and search" },
+        limit: { type: "integer", description: "Max results to return (default 5)", default: 5 }
+      },
+      required: ["text"]
+    }
+  },
+  {
+    name: "memory.notion.append",
+    description: "Append a new page to the NANCE Notion workspace.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        text: { type: "string", description: "Page body content" },
+        title: { type: "string", description: "Page title (optional)" }
+      },
+      required: ["text"]
+    }
+  },
+  {
+    name: "memory.notion.search",
+    description: "Search pages in the NANCE Notion workspace.",
+    inputSchema: {
+      type: "object",
+      properties: { query: { type: "string", description: "Search query" } },
+      required: ["query"]
+    }
+  },
+  {
+    name: "memory.context.build",
+    description: "Build a compressed NANCE context block from graph + log + semantic search. Use this at the start of every session to restore state efficiently.",
+    inputSchema: {
+      type: "object",
+      properties: { query: { type: "string", description: "Optional semantic anchor query for vector search" } },
+      required: []
+    }
+  },
+  {
+    name: "memory.context.ingest",
+    description: "Ingest a conversation turn into all three memory layers (Redis graph, Qdrant vector, Notion). The primary write operation.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Unique turn ID (e.g. 'turn_20260419_001')" },
+        text: { type: "string", description: "Full text content of the turn" },
+        tags: { type: "array", items: { type: "string" }, description: "Optional tags", default: [] },
+        graph_updates: { type: "object", description: "Optional key-value facts to write to graph", default: {} }
+      },
+      required: ["id", "text"]
+    }
+  },
+  {
+    name: "proxy.github",
+    description: "Proxy authenticated requests to the GitHub API. Requires GITHUB_TOKEN secret.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        method: { type: "string", enum: ["GET", "POST", "PATCH", "PUT", "DELETE"], default: "GET" },
+        path: { type: "string", description: "GitHub API path, e.g. /repos/ghostss4cg4/ghost-memory-mcp/issues" },
+        body: { type: "object", description: "Request body for mutating methods" }
+      },
+      required: ["path"]
+    }
+  },
+  {
+    name: "proxy.gmail",
+    description: "Proxy authenticated requests to the Gmail API. Requires Google OAuth secrets.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        method: { type: "string", default: "GET" },
+        path: { type: "string", description: "Gmail API path, e.g. /gmail/v1/users/me/messages" },
+        body: { type: "object" }
+      },
+      required: ["path"]
+    }
+  },
+  {
+    name: "proxy.calendar",
+    description: "Proxy authenticated requests to Google Calendar API. Requires Google OAuth secrets.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        method: { type: "string", default: "GET" },
+        path: { type: "string", description: "Calendar API path, e.g. /calendars/primary/events" },
+        body: { type: "object" }
+      },
+      required: ["path"]
+    }
+  }
+];
+
+// MCP manifest — returned by GET /mcp
+// Claude.ai reads this to enumerate tools and their schemas.
+const MCP_MANIFEST = {
+  schema_version: "v1",
+  name: "NANCE Memory Gateway",
+  description: "Persistent memory + GitHub proxy for Saumil's Claude accounts. Layers: Redis graph, Qdrant vector, Notion pages.",
+  version: "0.5.0",
+  tools: MCP_TOOL_SCHEMAS
+};
+
+// ── Stage 5: MCP Request Dispatcher ─────────────────────────
+// POST /mcp receives MCP-protocol JSON-RPC style calls:
+// { "method": "tools/call", "params": { "name": "<tool>", "arguments": { ... } } }
+// Returns MCP-protocol response:
+// { "content": [{ "type": "text", "text": "<JSON result>" }] }
+async function handleMCP(request, env) {
+  let body;
+  try { body = await request.json(); } catch { return json({ error: "Invalid JSON" }, 400); }
+
+  const method = body.method || "";
+  const params = body.params || {};
+
+  // tools/list — list all available tools
+  if (method === "tools/list") {
+    return json({ tools: MCP_TOOL_SCHEMAS });
+  }
+
+  // tools/call — invoke a tool
+  if (method === "tools/call") {
+    const toolName = params.name;
+    const args     = params.arguments || {};
+    if (!toolName) return json({ error: "params.name required" }, 400);
+    const fn = TOOLS[toolName];
+    if (!fn) return json({
+      isError: true,
+      content: [{ type: "text", text: JSON.stringify({ error: `Unknown tool: ${toolName}`, available: Object.keys(TOOLS) }) }]
+    }, 404);
+    try {
+      const result = await fn(env, args);
+      return json({
+        content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
+      });
+    } catch (e) {
+      return json({
+        isError: true,
+        content: [{ type: "text", text: JSON.stringify({ error: e.message }) }]
+      }, 500);
+    }
+  }
+
+  // initialize — Claude handshake (respond with server info)
+  if (method === "initialize") {
+    return json({
+      protocolVersion: "2024-11-05",
+      serverInfo: { name: "NANCE Memory Gateway", version: "0.5.0" },
+      capabilities: { tools: {} }
+    });
+  }
+
+  return json({ error: `Unknown MCP method: ${method}. Supported: initialize, tools/list, tools/call` }, 400);
+}
+
 // ── Router ───────────────────────────────────────────────────
 export default {
   async fetch(request, env) {
     const { pathname } = new URL(request.url);
     if (request.method === "OPTIONS") return cors(new Response(null, { status: 204 }));
-    if (pathname === "/health")     return json({ status: "ok", ts: Date.now(), worker: "saumil-memory-gateway", version: "0.4.0" });
-    if (!checkAuth(request, env))  return json({ error: "Unauthorized" }, 401);
+
+    // /health — unauthenticated
+    if (pathname === "/health")
+      return json({ status: "ok", ts: Date.now(), worker: "saumil-memory-gateway", version: "0.5.0" });
+
+    // /mcp — MCP protocol endpoints
+    if (pathname === "/mcp") {
+      // GET /mcp — manifest (no auth, Claude needs to read this to register)
+      if (request.method === "GET") return json(MCP_MANIFEST);
+      // POST /mcp — tool dispatch (auth required)
+      if (request.method === "POST") {
+        if (!checkAuth(request, env)) return json({ error: "Unauthorized" }, 401);
+        return handleMCP(request, env);
+      }
+    }
+
+    // Legacy endpoints — preserved
+    if (!checkAuth(request, env)) return json({ error: "Unauthorized" }, 401);
     if (pathname === "/snapshot" && request.method === "GET") return json({ ok: true, result: await TOOLS["memory.snapshot"](env) });
     if (pathname === "/graph"    && request.method === "GET") return json({ ok: true, result: await TOOLS["memory.graph.get"](env) });
     if (pathname === "/call"     && request.method === "POST") {
       let body;
       try { body = await request.json(); } catch { return json({ error: "Invalid JSON" }, 400); }
       const { tool, params = {} } = body;
-      if (!tool)     return json({ error: "tool required" }, 400);
+      if (!tool) return json({ error: "tool required" }, 400);
       const fn = TOOLS[tool];
-      if (!fn)       return json({ error: `Unknown tool: ${tool}`, available: Object.keys(TOOLS) }, 404);
+      if (!fn) return json({ error: `Unknown tool: ${tool}`, available: Object.keys(TOOLS) }, 404);
       try   { return json({ ok: true, result: await fn(env, params) }); }
       catch (e) { return json({ ok: false, error: e.message }, 500); }
     }
+
     return json({
       name: "NANCE Memory Gateway",
-      version: "0.4.0",
-      stage: "real-embeddings + proxy-scaffolding",
-      endpoints: ["/health", "/snapshot", "/graph", "/call"],
-      tools: Object.keys(TOOLS),
-      proxy_tools_status: {
-        "proxy.github":   env.GITHUB_TOKEN           ? "ready" : "needs GITHUB_TOKEN secret",
-        "proxy.gmail":    env.GOOGLE_REFRESH_TOKEN    ? "ready" : "needs Google OAuth secrets",
-        "proxy.calendar": env.GOOGLE_REFRESH_TOKEN    ? "ready" : "needs Google OAuth secrets"
-      }
+      version: "0.5.0",
+      stage: "MCP protocol layer live",
+      endpoints: ["/health", "/mcp (GET=manifest, POST=tool dispatch)", "/snapshot", "/graph", "/call"],
+      tools: Object.keys(TOOLS)
     });
   }
 };
