@@ -1,0 +1,21 @@
+{
+  "mcpServers": {
+    "NANCE": {
+      "command": "node",
+      "args": ["/ABSOLUTE/PATH/TO/ghost-memory-mcp/local-mcp/server.js"],
+      "env": {
+        "NANCE_WORKER_URL": "https://saumil-memory-gateway.saumil-nance.workers.dev",
+        "NANCE_AUTH_TOKEN": "saumilshah6@SS",
+        "NANCE_ALLOW_SHELL": "false"
+      }
+    },
+    "sequential-thinking": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-sequential-thinking"]
+    },
+    "context7": {
+      "command": "npx",
+      "args": ["-y", "--package=@upstash/context7-mcp", "context7-mcp"]
+    }
+  }
+}

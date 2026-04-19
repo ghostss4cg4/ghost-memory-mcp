@@ -1,0 +1,15 @@
+{
+  "name": "nance-local-mcp",
+  "version": "0.6.0",
+  "description": "NANCE local MCP server for Claude Desktop — proxies CF Worker + adds local OS tools",
+  "type": "module",
+  "main": "server.js",
+  "bin": { "nance-mcp": "server.js" },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.10.0"
+  },
+  "engines": { "node": ">=18" }
+}
